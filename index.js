@@ -164,101 +164,108 @@ app.post("/test", (req, res) => {
 
 // ─── Main WhatsApp Flow Endpoint (With Encryption) ──────────
 app.post("/whatsapp-flow", (req, res) => {
-  const PRIVATE_KEY = process.env.PRIVATE_KEY;
-
-  // If no private key set, handle without encryption (for preview/testing)
-  if (!PRIVATE_KEY) {
-    console.log("⚠️  No private key found, running without encryption");
-    const payload = req.body?.data || req.body;
-    return handlePayload(payload, res);
-  }
-
   try {
-    // Decrypt the incoming request
-    const { decryptedBody, aesKey, initialVector } = decryptRequest(
-      req.body,
-      PRIVATE_KEY
-    );
+    console.log("Incoming body:", JSON.stringify(req.body));
 
-    console.log("Decrypted body:", JSON.stringify(decryptedBody));
+    // 🔐 Load private key correctly
+    const PRIVATE_KEY = process.env.PRIVATE_KEY?.replace(/\\n/g, "\n");
 
-    const payload = decryptedBody.data || decryptedBody;
+    // =========================
+    // 🔒 ENCRYPTED FLOW REQUEST
+    // =========================
+    if (PRIVATE_KEY && req.body.encrypted_aes_key) {
+      const { encrypted_aes_key, encrypted_flow_data, initial_vector } = req.body;
 
-    // Build response
-    const responseData = buildResponse(payload);
+      // 1. Decrypt AES key
+      const aesKey = crypto.privateDecrypt(
+        {
+          key: PRIVATE_KEY,
+          padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+          oaepHash: "sha256"
+        },
+        Buffer.from(encrypted_aes_key, "base64")
+      );
 
-    if (!responseData) {
-      return res.status(400).json({ error: "Unknown action" });
+      // 2. Decrypt flow data
+      const iv = Buffer.from(initial_vector, "base64");
+      const encryptedData = Buffer.from(encrypted_flow_data, "base64");
+
+      const TAG_LENGTH = 16;
+      const encryptedText = encryptedData.slice(0, -TAG_LENGTH);
+      const authTag = encryptedData.slice(-TAG_LENGTH);
+
+      const decipher = crypto.createDecipheriv("aes-128-gcm", aesKey, iv);
+      decipher.setAuthTag(authTag);
+
+      const decrypted =
+        decipher.update(encryptedText, null, "utf8") +
+        decipher.final("utf8");
+
+      const body = JSON.parse(decrypted);
+      console.log("Decrypted body:", body);
+
+      const payload = body.data || body;
+
+      // 🔥 HANDLE INIT (VERY IMPORTANT)
+      let response;
+      if (payload.action === "INIT") {
+        response = {
+          version: "7.3",
+          screen: "FD_HOME",
+          data: {}
+        };
+      } else {
+        response = buildResponse(payload);
+      }
+
+      if (!response) {
+        return res.status(400).json({ error: "Invalid request" });
+      }
+
+      // 3. Encrypt response
+      const flippedIv = Buffer.from(iv.map(b => ~b & 0xff));
+
+      const cipher = crypto.createCipheriv("aes-128-gcm", aesKey, flippedIv);
+
+      const encryptedResponse = Buffer.concat([
+        cipher.update(JSON.stringify(response), "utf8"),
+        cipher.final(),
+        cipher.getAuthTag()
+      ]);
+
+      res.set("Content-Type", "text/plain");
+      return res.send(encryptedResponse.toString("base64"));
     }
 
-    // Encrypt and send response
-    const encryptedResponse = encryptResponse(
-      responseData,
-      aesKey,
-      initialVector
-    );
+    // =========================
+    // 🧪 UNENCRYPTED (TEST MODE)
+    // =========================
+    const payload = req.body.data || req.body;
 
-    return res.send(encryptedResponse);
+    console.log("Unencrypted payload:", payload);
 
-  } catch (error) {
-    console.error("❌ Error processing request:", error.message);
-    return res.status(500).json({ error: "Internal server error" });
+    let response;
+    if (payload.action === "INIT") {
+      response = {
+        version: "7.3",
+        screen: "FD_HOME",
+        data: {}
+      };
+    } else {
+      response = buildResponse(payload);
+    }
+
+    if (!response) {
+      return res.status(400).json({ error: "Invalid request" });
+    }
+
+    return res.json(response);
+
+  } catch (err) {
+    console.error("Flow Error:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
-
-// ─── Build Response Based on Action ────────────────────────
-function buildResponse(payload) {
-  const { action, amount, tenure } = payload;
-
-  if (action === "calculate") {
-    // Validate
-    if (!amount || !tenure) {
-      return null;
-    }
-
-    if (!rateMap[tenure]) {
-      return null;
-    }
-
-    const calc = calculateMaturity(amount, tenure);
-
-    return {
-      version: "7.3",
-      screen: "FD_SUMMARY",
-      data: {
-        amount: calc.principal.toLocaleString("en-IN"),
-        roi_tenure: `${calc.rate}% for ${calc.months} months`,
-        interest_payout: "Payout for Maturity",
-        maturity_amount: formatINR(calc.maturityAmount),
-        maturity_instruction: "Reinvest",
-        maturity_date: calc.maturityDate,
-        debited_from: "xxxxxx6719",
-        current_balance: "1,10,2221"
-      }
-    };
-  }
-
-  if (action === "confirm") {
-    return {
-      version: "7.3",
-      screen: "COMPLETE",
-      data: {}
-    };
-  }
-
-  return null;
-}
-
-// ─── Handle Payload (Unencrypted) ───────────────────────────
-function handlePayload(payload, res) {
-  const response = buildResponse(payload);
-
-  if (!response) {
-    return res.status(400).json({ error: "Unknown action or missing fields" });
-  }
-
-  return res.json(response);
-}
 
 // ─── Start Server ────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
